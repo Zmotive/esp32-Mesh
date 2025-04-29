@@ -92,6 +92,50 @@ UBXNavPVT nav_pvt;
 UBXNavSVIN nav_svin;
 SemaphoreHandle_t nav_data_mutex; // Mutex for protecting nav_pvt and nav_svin
 
+bool process_ubx_message(uint8_t *data, uint16_t *length) {
+    UBXHeader *header = (UBXHeader *)data;
+    if (header->preamble1 == 0xB5 && header->preamble2 == 0x62 && header->msg_class == 0x01){
+        if (header->msg_id == 0x3B) {
+            ESP_LOGI(TAG, "NAV-SVIN message received");
+            // Lock the mutex before modifying nav_svin
+            if (xSemaphoreTake(nav_data_mutex, portMAX_DELAY)) {
+                memcpy(&nav_svin, data + sizeof(UBXHeader), sizeof(UBXNavSVIN));
+                xSemaphoreGive(nav_data_mutex); // Unlock the mutex
+            } else {
+                ESP_LOGE(TAG, "Failed to lock mutex for nav_svin");
+            }
+            // Remove the UBX header and NAV-SVIN from the data buffer if it has additional data.
+            int copied_bytes = sizeof(UBXHeader) + sizeof(UBXNavSVIN) +2; // 2 bytes for CRC
+            if (*length > copied_bytes) {
+                ESP_LOGI(TAG, "NAV-SVIN message has additional data, length: %d", header->length);
+                memcpy(data, data + copied_bytes, *length - copied_bytes);
+            }
+            *length -= copied_bytes;
+            return true;
+        } else if (header->msg_id == 0x07) {
+            ESP_LOGI(TAG, "NAV-PVT message received");
+            // Lock the mutex before modifying nav_pvt
+            if (xSemaphoreTake(nav_data_mutex, portMAX_DELAY)) {
+                memcpy(&nav_pvt, data + sizeof(UBXHeader), sizeof(UBXNavPVT));
+                xSemaphoreGive(nav_data_mutex); // Unlock the mutex
+                
+            } else {
+                ESP_LOGE(TAG, "Failed to lock mutex for nav_pvt");
+            }
+            // Remove the UBX header and NAV-PVT from the data buffer if it has additional data.
+            int copied_bytes = sizeof(UBXHeader) + sizeof(UBXNavPVT) +2; // 2 bytes for CRC
+            if (*length > copied_bytes) {
+                ESP_LOGI(TAG, "NAV-PVT message has additional data, length: %d", header->length);
+                memcpy(data, data + copied_bytes, *length - copied_bytes);
+            }
+            *length -= copied_bytes;
+            return true;
+        }
+    }
+    ESP_LOGE(TAG, "Invalid UBX header: p1:0x%02X p2:0x%02X c:0x%02X id:0x%02X l:%d", 
+        header->preamble1, header->preamble2, header->msg_class, header->msg_id, header->length);
+    return false;
+}
 
 void setup_serial_port() {
     // Configure UART
@@ -115,12 +159,12 @@ void setup_serial_port() {
     }
 }
 
-
-
 uint8_t *read_serial_data(uint16_t *total_length) {
     uint16_t data_length;
     uint8_t *data_buffer = NULL;
-    int bytes_read = 0;
+    uint8_t *rtcm_buffer = NULL;
+    uint16_t rtcm_length = 0;
+    uint16_t bytes_read = 0;
     int length = 0;
 
     ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_NUM, (size_t*)&length));
@@ -134,76 +178,68 @@ uint8_t *read_serial_data(uint16_t *total_length) {
     
     // Allocate buffer for the UART data
     *total_length = length;
-    data_buffer = (uint8_t *)malloc(*total_length);
-    if (!data_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate memory for data buffer");
+    data_buffer = (uint8_t *)malloc(length);
+    rtcm_buffer = (uint8_t *)malloc(length);
+    if (!data_buffer || !rtcm_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate memory for buffers");
         return NULL;
     }
 
     // Read the data from UART
     bytes_read = uart_read_bytes(UART_NUM, data_buffer, length, pdMS_TO_TICKS(100));
 
+    int msg_count = 0;
+    while(bytes_read > 0) {
+        switch (data_buffer[0])  // Check the first byte of the data
+        {
+        case 0xD3:
+            // Extract data length from byte 2 and byte 3
+            data_length = ((data_buffer[1] & 0x03) << 8) | data_buffer[2];
 
-    switch (data_buffer[0])  // Check the first byte of the data
-    {
-    case 0xD3:
-        // Extract data length from byte 2 and byte 3
-        data_length = ((data_buffer[1] & 0x03) << 8) | data_buffer[2];
+            if (bytes_read < data_length + 6) {
+                ESP_LOGE(TAG, "Failed to read data bytes: got %d, expected %d", bytes_read, data_length + 3);
+                free(data_buffer);
+                return NULL;
+            }
+            memcpy(rtcm_buffer + rtcm_length, data_buffer, data_length + 6);
+            rtcm_length += data_length + 6;
+            
+            memcpy(data_buffer, data_buffer + data_length + 6, bytes_read - (data_length + 6));
+            bytes_read -= data_length + 6;
 
-        if (bytes_read < data_length + 3) {
-            ESP_LOGE(TAG, "Failed to read data bytes: got %d, expected %d", bytes_read, data_length + 3);
+            ESP_LOGI(TAG, "Successfully read %d bytes", data_length + 6);
+            if (bytes_read > 0) {
+                ESP_LOGI(TAG, "Remaining bytes: %d", bytes_read);
+            }
+
+            continue;
+
+        case 0xB5:  
+            if(!process_ubx_message(data_buffer, &bytes_read)) {
+                free(data_buffer);
+                return NULL;
+            }
+            continue;
+
+        default:
+            ESP_LOGE(TAG, "Unknown header byte: 0x%02X. Length: %d", data_buffer[0], bytes_read);
+            free(data_buffer);
+            return NULL;
+            break;
+        }  
+        if (msg_count > 4) {
+            ESP_LOGI(TAG, "Ending message reading due to excessive messages");
+            free(rtcm_buffer);
             free(data_buffer);
             return NULL;
         }
-
-        ESP_LOGI(TAG, "Successfully read %d bytes", bytes_read);
-
-        return data_buffer;
-        break;
-    
-    case 0xB5:  
-        UBXHeader *header = (UBXHeader *)data_buffer;
-
-        if (header->preamble1 == 0xB5 && header->preamble2 == 0x62
-        && header->msg_class == 0x01 && header->msg_id == 0x3B 
-        && header->length == 40) {
-            ESP_LOGE(TAG, "Updated NAV-SVIN message");
-            // Lock the mutex before modifying nav_svin
-            if (xSemaphoreTake(nav_data_mutex, portMAX_DELAY)) {
-                memcpy(&nav_svin, data_buffer + sizeof(UBXHeader), sizeof(UBXNavSVIN));
-                xSemaphoreGive(nav_data_mutex); // Unlock the mutex
-            } else {
-                ESP_LOGE(TAG, "Failed to lock mutex for nav_svin");
-            }
-            return NULL;
-
-        } else if (header->preamble1 == 0xB5 && header->preamble2 == 0x62
-        && header->msg_class == 0x01 && header->msg_id == 0x07 && header->length == 92) {
-            ESP_LOGE(TAG, "Updated NAV-PVT message");
-            // Lock the mutex before modifying nav_pvt
-            if (xSemaphoreTake(nav_data_mutex, portMAX_DELAY)) {
-                memcpy(&nav_pvt, data_buffer + sizeof(UBXHeader), sizeof(UBXNavPVT));
-                xSemaphoreGive(nav_data_mutex); // Unlock the mutex
-            } else {
-                ESP_LOGE(TAG, "Failed to lock mutex for nav_pvt");
-            }
-            return NULL;
-
-        } else {
-            ESP_LOGE(TAG, "Invalid UBX header: p1:0x%02X p2:0x%02X c:0x%02X id:0x%02X l:%d", header->preamble1, header->preamble2, header->msg_class, header->msg_id, header->length);
-            free(data_buffer);
-            return NULL;
-        }
-       
-
-        free(data_buffer);
-        return NULL;
-        break;
-    
-    default:
-        ESP_LOGE(TAG, "Unknown header byte: 0x%02X. Length: %d", data_buffer[0], bytes_read);
-        free(data_buffer);
-        return NULL;
-        break;
-    }  
+        msg_count++;
+    }
+    free(data_buffer);
+    if (rtcm_length > 0) {
+        ESP_LOGI(TAG, "RTCM data length: %d", rtcm_length);
+        return rtcm_buffer;
+    }
+    free(rtcm_buffer);
+    return NULL;
 }
