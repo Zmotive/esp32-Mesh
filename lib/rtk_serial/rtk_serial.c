@@ -189,6 +189,7 @@ uint8_t *read_serial_data(uint16_t *total_length) {
     bytes_read = uart_read_bytes(UART_NUM, data_buffer, length, pdMS_TO_TICKS(100));
 
     int msg_count = 0;
+    //TODO: Check the msg CRC of each message
     while(bytes_read > 0) {
         switch (data_buffer[0])  // Check the first byte of the data
         {
