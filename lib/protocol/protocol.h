@@ -1,10 +1,12 @@
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
-#include <cstdint>
+#include <stdint.h>
 
-// Enumeration for protocol types
-enum class ProtocolType : uint32_t {
+// Enumeration for protocol types (16-bit unsigned int)
+typedef uint16_t ProtocolType;
+
+enum {
     NETWORK_DATA = 0,
     RTK_DATA = 1,
     ROBOT_DATA = 2,
@@ -15,7 +17,7 @@ enum class ProtocolType : uint32_t {
 
 // Structure for protocol header
 typedef struct ProtocolHeader {
-    ProtocolType type;  // 32-bit unsigned int as an enumeration
+    ProtocolType type;  // 16-bit unsigned int as an enumeration
     uint16_t length;    // 16-bit unsigned int for length
 } ProtocolHeader_t;
 

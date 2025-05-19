@@ -1,10 +1,5 @@
-#include <stdio.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
-#include "driver/uart.h"
-#include "esp_log.h"
-#include "freertos/semphr.h" // Include FreeRTOS semaphore header
+#include "rtk_serial.h"
+
 
 #define UART_NUM UART_NUM_1
 #define UART_BAUD_RATE 115200
@@ -12,100 +7,55 @@
 
 static const char *TAG = "RTK_SERIAL";
 
-/*
-U-center MSG configuration for base station:
-0xB5 0x62 preable
-NAV-SVIN (Survey In, if RTK is ready) 5s
-    found here: https://content.u-blox.com/sites/default/files/products/documents/u-blox8-M8_ReceiverDescrProtSpec_UBX-13003221.pdf?utm_content=UBX-13003221
-NAV-PVT (Position Velocity Time, Master time and fix information) 5s
-    found here: https://content.u-blox.com/sites/default/files/LAP120_Interfacedescription_UBX-20046191.pdf
+UBXNavPVT g_nav_pvt;
+UBXNavSVIN g_nav_svin;
+SemaphoreHandle_t g_nav_data_mutex; // Mutex for protecting nav_pvt and nav_svin
 
-0xD3 Messages
-RTCM3.3 1005 1s
-RTCM3.3 1074 1s
-RTCM3.3 1084 1s
-RTCM3.3 1094 1s
-RTCM3.3 1124 1s
-RTCM3.3 1230 x 5s
-*/
-typedef struct UBXHeader {
-    uint8_t preamble1;
-    uint8_t preamble2;
-    uint8_t msg_class;
-    uint8_t msg_id;
-    uint16_t length;
-} UBXHeader;
 
-typedef struct UBXNavPVT {
-    uint32_t iTOW;
-    uint16_t year;
-    uint8_t month;
-    uint8_t day;
-    uint8_t hour;
-    uint8_t min;
-    uint8_t sec;
-    uint8_t valid;
-    uint32_t tAcc;
-    int32_t nano;
-    uint8_t fixType;
-    uint8_t flags;
-    uint8_t flags2;
-    uint8_t numSV;
-    int32_t lon;
-    int32_t lat;
-    int32_t height;
-    int32_t hMSL;
-    uint32_t hAcc;
-    uint32_t vAcc;
-    int32_t velN;
-    int32_t velE;
-    int32_t velD;
-    int32_t gSpeed;
-    int32_t headMot;
-    uint32_t sAcc;
-    uint32_t headAcc;
-    uint16_t pDOP;
-    uint8_t flags3;
-    uint32_t reserved0;
-    int32_t headVeh;
-    int16_t magDec;
-    uint16_t magAcc;
-} UBXNavPVT;
-
-typedef struct UBXNavSVIN {
-    uint8_t version;
-    uint32_t iTOW;
-    uint32_t dur;
-    int32_t meanX;
-    int32_t meanY;
-    int32_t meanZ;
-    int8_t meanXHP;
-    int8_t meanYHP;
-    int8_t meanZHP;
-    uint32_t meanAcc;
-    uint32_t obs;
-    uint8_t valid;
-    uint8_t active;
-} UBXNavSVIN;
-
-UBXNavPVT nav_pvt;
-UBXNavSVIN nav_svin;
-SemaphoreHandle_t nav_data_mutex; // Mutex for protecting nav_pvt and nav_svin
-
+/**
+ * @brief Process a UBX message from the provided data buffer.
+ *
+ * This function checks the UBX header and, if valid, processes supported UBX messages (NAV-SVIN and NAV-PVT).
+ * It verifies the message type, checks the CRC (Fletcher-8), and only copies the payload into the appropriate global structure (nav_svin or nav_pvt) if the CRC is valid.
+ * The function also manages a mutex to protect shared data, and removes the processed message from the buffer. If the CRC fails, the message is rejected and not copied.
+ *
+ * @param data    Pointer to the buffer containing the UBX message. The buffer may contain additional data after the message.
+ * @param length  Pointer to the length of the data buffer. This will be updated to reflect the remaining unprocessed data.
+ * @return true if a supported UBX message was processed and copied (CRC must pass); false otherwise.
+ */
 bool process_ubx_message(uint8_t *data, uint16_t *length) {
     UBXHeader *header = (UBXHeader *)data;
     if (header->preamble1 == 0xB5 && header->preamble2 == 0x62 && header->msg_class == 0x01){
+        // Calculate UBX message length: header (6) + payload + CRC (2)
+        int payload_len = header->length;
+        int ubx_msg_len = sizeof(UBXHeader) + payload_len + 2;
+        if (*length < ubx_msg_len) {
+            ESP_LOGE(TAG, "UBX message incomplete: got %d, expected %d", *length, ubx_msg_len);
+            return false;
+        }
+        // Calculate CRC (Fletcher-8)
+        uint8_t ck_a = 0, ck_b = 0;
+        for (int i = 2; i < 6 + payload_len; i++) { // class, id, length, payload
+            ck_a += data[i];
+            ck_b += ck_a;
+        }
+        uint8_t msg_ck_a = data[6 + payload_len];
+        uint8_t msg_ck_b = data[6 + payload_len + 1];
+        if (ck_a != msg_ck_a || ck_b != msg_ck_b) {
+            ESP_DRAM_LOGW(TAG, "UBX CRC mismatch: calc=0x%02X%02X, msg=0x%02X%02X", ck_a, ck_b, msg_ck_a, msg_ck_b);
+            return false;
+        }
         if (header->msg_id == 0x3B) {
             ESP_LOGI(TAG, "NAV-SVIN message received");
             // Lock the mutex before modifying nav_svin
-            if (xSemaphoreTake(nav_data_mutex, portMAX_DELAY)) {
-                memcpy(&nav_svin, data + sizeof(UBXHeader), sizeof(UBXNavSVIN));
-                xSemaphoreGive(nav_data_mutex); // Unlock the mutex
+            if (xSemaphoreTake(g_nav_data_mutex, portMAX_DELAY)) {
+                memcpy(&g_nav_svin, data + sizeof(UBXHeader), sizeof(UBXNavSVIN));
+                xSemaphoreGive(g_nav_data_mutex); // Unlock the mutex
             } else {
                 ESP_LOGE(TAG, "Failed to lock mutex for nav_svin");
             }
             // Remove the UBX header and NAV-SVIN from the data buffer if it has additional data.
-            int copied_bytes = sizeof(UBXHeader) + sizeof(UBXNavSVIN) +2; // 2 bytes for CRC
+            int copied_bytes = sizeof(UBXHeader) + sizeof(UBXNavSVIN) + 2; // 2 bytes for CRC
             if (*length > copied_bytes) {
                 ESP_LOGI(TAG, "NAV-SVIN message has additional data, length: %d", header->length);
                 memcpy(data, data + copied_bytes, *length - copied_bytes);
@@ -115,15 +65,27 @@ bool process_ubx_message(uint8_t *data, uint16_t *length) {
         } else if (header->msg_id == 0x07) {
             ESP_LOGI(TAG, "NAV-PVT message received");
             // Lock the mutex before modifying nav_pvt
-            if (xSemaphoreTake(nav_data_mutex, portMAX_DELAY)) {
-                memcpy(&nav_pvt, data + sizeof(UBXHeader), sizeof(UBXNavPVT));
-                xSemaphoreGive(nav_data_mutex); // Unlock the mutex
-                
+            if (xSemaphoreTake(g_nav_data_mutex, portMAX_DELAY)) {
+                memcpy(&g_nav_pvt, data + sizeof(UBXHeader), sizeof(UBXNavPVT));
+                xSemaphoreGive(g_nav_data_mutex); // Unlock the mutex
             } else {
                 ESP_LOGE(TAG, "Failed to lock mutex for nav_pvt");
             }
+            // Update global GPS PTP time structure (in microseconds)
+            // Valid bit 1 is valid Date, 2 is valid Time, 4 is fully resolved:
+            // 0x07 = 1 + 2 + 4. See https://content.u-blox.com/sites/default/files/ZED-F9P_IntegrationManual_UBX-18010802.pdf pg 61 for details.
+            if ( ((g_nav_pvt.valid & 0x07) == 0x07) && xSemaphoreTake(g_gps_ptp_time_mutex, portMAX_DELAY)) {
+                g_gps_ptp_time.gps_iTOW_us = g_nav_pvt.iTOW * 1000ULL + (int64_t)((g_nav_pvt.nano + 500) / 1000); // Combine iTOW and nano, both in us
+                g_gps_ptp_time.updated_us = (uint64_t)esp_timer_get_time(); // Already in us
+                g_gps_ptp_time.tAcc_us = (g_nav_pvt.tAcc + 500) / 1000; // Convert ns to us, rounding
+                xSemaphoreGive(g_gps_ptp_time_mutex);
+                ESP_LOGI(TAG, "NAV-PVT iTOW: %llu, tAcc: %lu, updated_us: %llu", g_gps_ptp_time.gps_iTOW_us, g_gps_ptp_time.tAcc_us, g_gps_ptp_time.updated_us);
+            }
+            else {
+                ESP_LOGW(TAG, "NAV-PVT time not valid: 0x%02X", g_nav_pvt.valid);
+            }
             // Remove the UBX header and NAV-PVT from the data buffer if it has additional data.
-            int copied_bytes = sizeof(UBXHeader) + sizeof(UBXNavPVT) +2; // 2 bytes for CRC
+            int copied_bytes = sizeof(UBXHeader) + sizeof(UBXNavPVT) + 2; // 2 bytes for CRC
             if (*length > copied_bytes) {
                 ESP_LOGI(TAG, "NAV-PVT message has additional data, length: %d", header->length);
                 memcpy(data, data + copied_bytes, *length - copied_bytes);
@@ -153,9 +115,13 @@ void setup_serial_port() {
     ESP_LOGI(TAG, "UART configured and driver installed");
 
     // Initialize the mutex
-    nav_data_mutex = xSemaphoreCreateMutex();
-    if (nav_data_mutex == NULL) {
+    g_nav_data_mutex = xSemaphoreCreateMutex();
+    if (g_nav_data_mutex == NULL) {
         ESP_LOGE(TAG, "Failed to create mutex for nav data");
+    }
+    g_gps_ptp_time_mutex = xSemaphoreCreateMutex();
+    if (g_gps_ptp_time_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create mutex for time data");
     }
 }
 
@@ -189,7 +155,6 @@ uint8_t *read_serial_data(uint16_t *total_length) {
     bytes_read = uart_read_bytes(UART_NUM, data_buffer, length, pdMS_TO_TICKS(100));
 
     int msg_count = 0;
-    //TODO: Check the msg CRC of each message
     while(bytes_read > 0) {
         switch (data_buffer[0])  // Check the first byte of the data
         {
