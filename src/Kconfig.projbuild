@@ -179,11 +179,11 @@ menu "Mesh Configuration"
             The number of devices over the network(max: 300).
     
     config DATASERVER_ADDRESS
-        string "Data server address (mDNS/DNS or IP)"
-        default "machine.local"
+        string "Data server address (hostname or IPv4 address only)"
+        default "machine"
         help
-            The address (hostname, mDNS, or IP) of the log server to which logs will be sent.
-            Example: "machine.local", "192.168.1.100", or any valid DNS/mDNS name.
+          The address (hostname or IPv4 address) of the log server to which logs will be sent.
+          Example: "machine", "192.168.1.100", or any valid DNS/mDNS hostname (without .local).
 
     config DATASERVER_PORT
         int "Data server TCP port"

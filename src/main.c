@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
+#include "mdns.h"
 
 /*******************************************************
  *                Macros
@@ -416,28 +417,81 @@ static int log_server_sock = -1;
 
 // Connect to the log server (call once at startup)
 static void connect_log_server(void) {
+    // Only support hostnames (no .local) or IPv4 addresses
+    const char *addr = CONFIG_DATASERVER_ADDRESS;
+    // Try to parse as IPv4 address first
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(CONFIG_DATASERVER_PORT);
+    if (inet_pton(AF_INET, addr, &sa.sin_addr) == 1) {
+        // It's a valid IPv4 address
+        log_server_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (log_server_sock >= 0 && connect(log_server_sock, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+            ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d (IPv4)", addr, CONFIG_DATASERVER_PORT);
+            return;
+        } else {
+            ESP_LOGE(MESH_TAG, "Failed to connect to log server at %s:%d (IPv4)", addr, CONFIG_DATASERVER_PORT);
+            if (log_server_sock >= 0) close(log_server_sock);
+            log_server_sock = -1;
+            return;
+        }
+    }
+    // Otherwise, treat as hostname: try DNS, if fails, try mDNS
     struct addrinfo hints = {0};
     struct addrinfo *res = NULL;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%d", CONFIG_DATASERVER_PORT);
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-
-    int err = getaddrinfo(CONFIG_DATASERVER_ADDRESS, port_str, &hints, &res);
-    if (err != 0 || res == NULL) {
-        ESP_LOGE(MESH_TAG, "Failed to resolve log server address '%s'", CONFIG_DATASERVER_ADDRESS);
+    int err = getaddrinfo(addr, port_str, &hints, &res);
+    if (err == 0 && res != NULL) {
+        log_server_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (log_server_sock >= 0 && connect(log_server_sock, res->ai_addr, res->ai_addrlen) == 0) {
+            ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d (DNS)", addr, CONFIG_DATASERVER_PORT);
+            freeaddrinfo(res);
+            return;
+        } else {
+            ESP_LOGE(MESH_TAG, "Failed to connect to log server at %s:%d (DNS)", addr, CONFIG_DATASERVER_PORT);
+            if (log_server_sock >= 0) close(log_server_sock);
+            log_server_sock = -1;
+            freeaddrinfo(res);
+            // continue to mDNS fallback
+        }
+    } else {
+        ESP_LOGW(MESH_TAG, "DNS resolution failed for '%s', trying mDNS fallback", addr);
+    }
+    // mDNS fallback: try as hostname (no .local)
+    //initialize mDNS service
+    esp_err_t mdns_err = mdns_init();
+    if (mdns_err) {
+        ESP_LOGE(MESH_TAG, "MDNS Init failed: %d\n", mdns_err);
         return;
     }
-
-    log_server_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (log_server_sock >= 0 && connect(log_server_sock, res->ai_addr, res->ai_addrlen) == 0) {
-        ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d", CONFIG_DATASERVER_ADDRESS, CONFIG_DATASERVER_PORT);
+    char mdns_hostname[64] = {0};
+    size_t addr_len = strlen(addr);
+    if (addr_len >= sizeof(mdns_hostname)) addr_len = sizeof(mdns_hostname) - 1;
+    strncpy(mdns_hostname, addr, addr_len);
+    mdns_hostname[addr_len] = '\0';
+    esp_ip4_addr_t ip4_addr;
+    mdns_err = mdns_query_a(mdns_hostname, 2000, &ip4_addr);
+    if (mdns_err == ESP_OK) {
+        struct sockaddr_in sa_mdns = {0};
+        sa_mdns.sin_family = AF_INET;
+        sa_mdns.sin_port = htons(CONFIG_DATASERVER_PORT);
+        sa_mdns.sin_addr.s_addr = ip4_addr.addr;
+        log_server_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (log_server_sock >= 0 && connect(log_server_sock, (struct sockaddr *)&sa_mdns, sizeof(sa_mdns)) == 0) {
+            ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d (mDNS fallback)", addr, CONFIG_DATASERVER_PORT);
+            return;
+        } else {
+            ESP_LOGE(MESH_TAG, "Failed to connect to log server at %s:%d (mDNS fallback)", addr, CONFIG_DATASERVER_PORT);
+            if (log_server_sock >= 0) close(log_server_sock);
+            log_server_sock = -1;
+            return;
+        }
     } else {
-        ESP_LOGE(MESH_TAG, "Failed to connect to log server at %s:%d", CONFIG_DATASERVER_ADDRESS, CONFIG_DATASERVER_PORT);
-        if (log_server_sock >= 0) close(log_server_sock);
-        log_server_sock = -1;
+        ESP_LOGE(MESH_TAG, "mDNS query failed for %s: %d", mdns_hostname, mdns_err);
     }
-    freeaddrinfo(res);
 }
 
 // Wrapper function to log to both the original function and the remote log server
