@@ -406,25 +406,38 @@ void set_node_type() {
 static vprintf_like_t original_vprintf = NULL;
 
 // TCP log server configuration
-#define LOG_SERVER_IP "10.0.0.84"
-#define LOG_SERVER_PORT 9000
+#ifndef CONFIG_DATASERVER_ADDRESS
+#define CONFIG_DATASERVER_ADDRESS "machine.local"
+#endif
+#ifndef CONFIG_DATASERVER_PORT
+#define CONFIG_DATASERVER_PORT 9000
+#endif
 static int log_server_sock = -1;
 
 // Connect to the log server (call once at startup)
 static void connect_log_server(void) {
-    struct sockaddr_in server_addr = {0};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(LOG_SERVER_PORT);
-    server_addr.sin_addr.s_addr = inet_addr(LOG_SERVER_IP);
+    struct addrinfo hints = {0};
+    struct addrinfo *res = NULL;
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", CONFIG_DATASERVER_PORT);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
 
-    log_server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (log_server_sock >= 0 && connect(log_server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == 0) {
-        ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d", LOG_SERVER_IP, LOG_SERVER_PORT);
+    int err = getaddrinfo(CONFIG_DATASERVER_ADDRESS, port_str, &hints, &res);
+    if (err != 0 || res == NULL) {
+        ESP_LOGE(MESH_TAG, "Failed to resolve log server address '%s'", CONFIG_DATASERVER_ADDRESS);
+        return;
+    }
+
+    log_server_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (log_server_sock >= 0 && connect(log_server_sock, res->ai_addr, res->ai_addrlen) == 0) {
+        ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d", CONFIG_DATASERVER_ADDRESS, CONFIG_DATASERVER_PORT);
     } else {
-        ESP_LOGE(MESH_TAG, "Failed to connect to log server");
+        ESP_LOGE(MESH_TAG, "Failed to connect to log server at %s:%d", CONFIG_DATASERVER_ADDRESS, CONFIG_DATASERVER_PORT);
         if (log_server_sock >= 0) close(log_server_sock);
         log_server_sock = -1;
     }
+    freeaddrinfo(res);
 }
 
 // Wrapper function to log to both the original function and the remote log server

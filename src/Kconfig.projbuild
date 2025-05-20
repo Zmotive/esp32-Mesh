@@ -177,6 +177,20 @@ menu "Mesh Configuration"
         default 50
         help
             The number of devices over the network(max: 300).
+    
+    config DATASERVER_ADDRESS
+        string "Data server address (mDNS/DNS or IP)"
+        default "machine.local"
+        help
+            The address (hostname, mDNS, or IP) of the log server to which logs will be sent.
+            Example: "machine.local", "192.168.1.100", or any valid DNS/mDNS name.
+
+    config DATASERVER_PORT
+        int "Data server TCP port"
+        default 9000
+        help
+            The TCP port number of the log server. Default is 9000.
+
 endmenu
 
 menu "Battery Voltage Input Configuration"
