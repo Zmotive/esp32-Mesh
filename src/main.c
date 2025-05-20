@@ -18,6 +18,9 @@
 #include "esp_mesh_internal.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
 
 /*******************************************************
  *                Macros
@@ -44,8 +47,6 @@ static int mesh_layer = -1;
 static esp_netif_t *netif_sta = NULL;
 static adc_channel_t adc_channel;
 static adc_oneshot_unit_handle_t adc_handle;
-static char log_buffer[LOG_BUFFER_SIZE];
-static size_t log_buffer_index = 0;
 
 typedef enum {
         NODE_TYPE_UNKNOWN, // Default value if no flags are defined
@@ -404,44 +405,43 @@ void set_node_type() {
 // Pointer to store the original vprintf function
 static vprintf_like_t original_vprintf = NULL;
 
-// Wrapper function to log to both the original function and the custom logger
+// TCP log server configuration
+#define LOG_SERVER_IP "10.0.0.84"
+#define LOG_SERVER_PORT 9000
+static int log_server_sock = -1;
+
+// Connect to the log server (call once at startup)
+static void connect_log_server(void) {
+    struct sockaddr_in server_addr = {0};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(LOG_SERVER_PORT);
+    server_addr.sin_addr.s_addr = inet_addr(LOG_SERVER_IP);
+
+    log_server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (log_server_sock >= 0 && connect(log_server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == 0) {
+        ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d", LOG_SERVER_IP, LOG_SERVER_PORT);
+    } else {
+        ESP_LOGE(MESH_TAG, "Failed to connect to log server");
+        if (log_server_sock >= 0) close(log_server_sock);
+        log_server_sock = -1;
+    }
+}
+
+// Wrapper function to log to both the original function and the remote log server
 static int dual_log_function(const char *format, va_list args) {
-    // Call the original logging function
     int written = 0;
     if (original_vprintf) {
         written = original_vprintf(format, args);
     }
-
-    // Call the custom logging function
-    int custom_written = vsnprintf(&log_buffer[log_buffer_index], LOG_BUFFER_SIZE - log_buffer_index, format, args);
-    if (custom_written > 0) {
-        log_buffer_index = (log_buffer_index + custom_written) % LOG_BUFFER_SIZE;
+    if (log_server_sock >= 0) {
+        char log_line[256];
+        int len = vsnprintf(log_line, sizeof(log_line), format, args);
+        if (len > 0) {
+            // Send to server, ignore errors
+            send(log_server_sock, log_line, len, 0);
+        }
     }
-
     return written;
-}
-
-// HTTP GET handler to serve the log buffer
-static esp_err_t log_get_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_send(req, log_buffer, log_buffer_index);
-}
-
-// Start the HTTP server
-static httpd_handle_t start_webserver(void) {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t server = NULL;
-
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t log_uri = {
-            .uri      = "/logs",
-            .method   = HTTP_GET,
-            .handler  = log_get_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &log_uri);
-    }
-    return server;
 }
 
 void ip_event_handler(void *arg, esp_event_base_t event_base,
@@ -449,8 +449,7 @@ void ip_event_handler(void *arg, esp_event_base_t event_base,
     ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
     ESP_LOGI(MESH_TAG, "<IP_EVENT_STA_GOT_IP>IP:" IPSTR, IP2STR(&event->ip_info.ip));
 
-    // Start the webserver when an IP is obtained
-    start_webserver();
+    connect_log_server();
 }
 
 void app_main(void)
