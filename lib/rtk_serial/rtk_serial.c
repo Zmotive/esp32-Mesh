@@ -5,11 +5,15 @@
 #define UART_BAUD_RATE 115200
 #define UART_BUF_SIZE 1024
 
-static const char *TAG = "RTK_SERIAL";
+static const char *TAG = "rtk_serial";
 
 UBXNavPVT g_nav_pvt;
 UBXNavSVIN g_nav_svin;
 SemaphoreHandle_t g_nav_data_mutex; // Mutex for protecting nav_pvt and nav_svin
+
+// Python struct format strings for UBXNavPVT and UBXNavSVIN (compact form)
+const char *UBXNavPVT_FORMAT = "<IH6BIi4B4i2I5i2I2HIihH";
+const char *UBXNavSVIN_FORMAT = "<B3x2I3i3bx2I2B2x";
 
 
 /**
@@ -50,6 +54,7 @@ bool process_ubx_message(uint8_t *data, uint16_t *length) {
             // Lock the mutex before modifying nav_svin
             if (xSemaphoreTake(g_nav_data_mutex, portMAX_DELAY)) {
                 memcpy(&g_nav_svin, data + sizeof(UBXHeader), sizeof(UBXNavSVIN));
+                PROTOCOL_LOG_STRUCT_BASE64(ESP_LOG_INFO, DATATAG, &g_nav_svin, UBXNavSVIN, UBXNavSVIN_FORMAT);
                 xSemaphoreGive(g_nav_data_mutex); // Unlock the mutex
             } else {
                 ESP_LOGE(TAG, "Failed to lock mutex for nav_svin");
@@ -67,6 +72,7 @@ bool process_ubx_message(uint8_t *data, uint16_t *length) {
             // Lock the mutex before modifying nav_pvt
             if (xSemaphoreTake(g_nav_data_mutex, portMAX_DELAY)) {
                 memcpy(&g_nav_pvt, data + sizeof(UBXHeader), sizeof(UBXNavPVT));
+                PROTOCOL_LOG_STRUCT_BASE64(ESP_LOG_INFO, DATATAG, &g_nav_pvt, UBXNavPVT, UBXNavPVT_FORMAT);
                 xSemaphoreGive(g_nav_data_mutex); // Unlock the mutex
             } else {
                 ESP_LOGE(TAG, "Failed to lock mutex for nav_pvt");

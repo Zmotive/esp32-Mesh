@@ -8,6 +8,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "../gps_ptp_time/gps_ptp_time.h"
+#include "../protocol/protocol.h" // For PROTOCOL_LOG_STRUCT_BASE64
 #include "esp_timer.h" // For esp_timer_get_time()
 
 /*
@@ -63,7 +64,7 @@ typedef struct UBXNavPVT {
     uint32_t sAcc;
     uint32_t headAcc;
     uint16_t pDOP;
-    uint8_t flags3;
+    uint16_t flags3;
     uint32_t reserved0;
     int32_t headVeh;
     int16_t magDec;
