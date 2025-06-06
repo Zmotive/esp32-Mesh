@@ -6,6 +6,11 @@
 #include <inttypes.h>
 #include <string.h>
 #include <time.h>
+#include "esp_log.h"
+#include "esp_mesh.h"
+#include "protocol.h"
+#include "esp_mac.h"
+#include "../xiao_esp32c6/cfg_helper.h"
 
 extern const char *DATATAG;
 
@@ -18,6 +23,10 @@ enum {
     ROBOT_DATA = 2,
     PTP_DATA = 3,
     MASTER_CLOCK_DATA = 4,
+    OTA_DATA = 5, // Added for OTA packets
+    ECHO_DATA = 6, // Added for echo protocol
+    FW_QUERY = 7,   // Firmware query protocol
+    FW_REPORT = 8,  // Firmware report protocol
     // Add more types as needed
 };
 
@@ -83,6 +92,11 @@ static inline size_t protocol_base64_encode(const uint8_t *src, size_t len, char
     protocol_base64_encode((const uint8_t*)plog_struct, plog_struct_size, plog_b64, plog_b64_size); \
     ESP_LOG_LEVEL(level, tag, "NAME:%s FORMAT:%s LEN:%u BASE64:%s", #struct_type, format_str, (unsigned)plog_struct_size, plog_b64); \
 } while(0)
+
+void protocol_handle_echo_packet(const mesh_addr_t *from, const void *payload, size_t payload_len, int mesh_layer, int is_root, int send_count);
+void handle_echo_packet(const mesh_addr_t *from, const void *payload, size_t payload_len, int mesh_layer, int is_root, int send_count, uint8_t *tx_buf);
+void handle_fw_query_packet(const mesh_addr_t *from, uint8_t *tx_buf, device_config_t *config);
+void handle_fw_report_packet(const mesh_addr_t *from, const void *payload, size_t payload_len);
 
 #ifdef __cplusplus
 }

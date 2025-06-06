@@ -17,11 +17,10 @@
 #include "esp_mesh.h"
 #include "esp_mesh_internal.h"
 #include "nvs_flash.h"
-#include "esp_http_server.h"
 #include <sys/socket.h>
 #include <netdb.h>
-#include <unistd.h>
-#include "mdns.h"
+#include "mesh_ota.h"
+#include "protocol.h"
 
 /*******************************************************
  *                Macros
@@ -48,6 +47,7 @@ static int mesh_layer = -1;
 static esp_netif_t *netif_sta = NULL;
 static adc_channel_t adc_channel;
 static adc_oneshot_unit_handle_t adc_handle;
+static device_config_t dcfg;
 
 typedef enum {
         NODE_TYPE_UNKNOWN, // Default value if no flags are defined
@@ -67,6 +67,7 @@ node_type_t node_type;
  *******************************************************/
 void esp_mesh_p2p_tx_main(void *arg)
 {
+#ifdef CONFIG_ENABLE_ECHO_PROTOCOL
     int i;
     esp_err_t err;
     int send_count = 0;
@@ -79,6 +80,7 @@ void esp_mesh_p2p_tx_main(void *arg)
     data.tos = MESH_TOS_P2P;
     is_running = true;
 
+
     while (is_running) {
         /* non-root do nothing but print */
         if (!esp_mesh_is_root()) {
@@ -90,42 +92,33 @@ void esp_mesh_p2p_tx_main(void *arg)
         }
         esp_mesh_get_routing_table((mesh_addr_t *) &route_table,
                                    CONFIG_MESH_ROUTE_TABLE_SIZE * 6, &route_table_size);
-        if (send_count && !(send_count % 100)) {
-            ESP_LOGI(MESH_TAG, "size:%d/%d,send_count:%d", route_table_size,
-                     esp_mesh_get_routing_table_size(), send_count);
-        }
         send_count++;
-        memcpy(&tx_buf[0], &send_count, sizeof(send_count));
-
+        // Prepare echo protocol packet
+        ProtocolHeader_t *header = (ProtocolHeader_t *)tx_buf;
+        header->type = ECHO_DATA; // Add ECHO_DATA to ProtocolType in protocol.h
+        header->length = sizeof(send_count);
+        memcpy(tx_buf + sizeof(ProtocolHeader_t), &send_count, sizeof(send_count));
+        data.size = sizeof(ProtocolHeader_t) + sizeof(send_count);
         for (i = 0; i < route_table_size; i++) {
             err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
             if (err) {
                 ESP_LOGE(MESH_TAG,
-                         "[ROOT-2-UNICAST:%d][L:%d]parent:"MACSTR" to "MACSTR", heap:%" PRId32 "[err:0x%x, proto:%d, tos:%d]",
+                         "[ECHO:%d][L:%d]parent:"MACSTR" to "MACSTR", heap:%" PRId32 "[err:0x%x, proto:%d, tos:%d]",
                          send_count, mesh_layer, MAC2STR(mesh_parent_addr.addr),
-                         MAC2STR(route_table[i].addr), esp_get_minimum_free_heap_size(),
-                         err, data.proto, data.tos);
-            } else if (!(send_count % 100)) {
-                ESP_LOGW(MESH_TAG,
-                         "[ROOT-2-UNICAST:%d][L:%d][rtableSize:%d]parent:"MACSTR" to "MACSTR", heap:%" PRId32 "[err:0x%x, proto:%d, tos:%d]",
-                         send_count, mesh_layer,
-                         esp_mesh_get_routing_table_size(),
-                         MAC2STR(mesh_parent_addr.addr),
                          MAC2STR(route_table[i].addr), esp_get_minimum_free_heap_size(),
                          err, data.proto, data.tos);
             }
         }
-        /* if route_table_size is less than 10, add delay to avoid watchdog in this task. */
         if (route_table_size < 10) {
             vTaskDelay(1 * 1000 / portTICK_PERIOD_MS);
         }
     }
+#endif
     vTaskDelete(NULL);
 }
 
 void esp_mesh_p2p_rx_main(void *arg)
 {
-    int recv_count = 0;
     esp_err_t err;
     mesh_addr_t from;
     int send_count = 0;
@@ -142,19 +135,35 @@ void esp_mesh_p2p_rx_main(void *arg)
             ESP_LOGE(MESH_TAG, "err:0x%x, size:%d", err, data.size);
             continue;
         }
-        /* extract send count */
-        if (data.size >= sizeof(send_count)) {
-            memcpy(&send_count, &data.data[0], sizeof(send_count));
+        if (data.size < sizeof(ProtocolHeader_t)) {
+            ESP_LOGW(MESH_TAG, "Received packet too small for ProtocolHeader");
+            continue;
         }
-        recv_count++;
-        if (!(recv_count % 1)) {
-            ESP_LOGW(MESH_TAG,
-                     "[#RX:%d/%d][L:%d][B:%dmV] parent:"MACSTR", receive from "MACSTR", size:%d, heap:%" PRId32 ", flag:%d[err:0x%x, proto:%d, tos:%d]",
-                     recv_count, send_count, mesh_layer, 
-                     CONFIG_BATTERY_ANALOG_PIN != -1 ? read_battery_mv(adc_channel, &adc_handle) : 0,
-                     MAC2STR(mesh_parent_addr.addr), MAC2STR(from.addr),
-                     data.size, esp_get_minimum_free_heap_size(), flag, err, data.proto,
-                     data.tos);
+        ProtocolHeader_t *header = (ProtocolHeader_t *)data.data;
+        void *payload = (void *)(data.data + sizeof(ProtocolHeader_t));
+        size_t payload_len = data.size - sizeof(ProtocolHeader_t);
+
+        switch (header->type) {
+            case OTA_DATA: // Add OTA_DATA to your ProtocolType enum in protocol.h
+                if (payload_len >= sizeof(mesh_ota_packet_t)) {
+                    mesh_ota_handle_packet((const mesh_ota_packet_t *)payload);
+                } else {
+                    ESP_LOGW(MESH_TAG, "OTA packet too small: %u", (unsigned)payload_len);
+                }
+                break;
+            case ECHO_DATA:
+                handle_echo_packet(&from, payload, payload_len, mesh_layer, esp_mesh_is_root(), send_count, tx_buf);
+                break;
+            case FW_QUERY:
+                handle_fw_query_packet(&from, tx_buf, &dcfg);
+                break;
+            case FW_REPORT:
+                handle_fw_report_packet(&from, payload, payload_len);
+                break;
+            // ... handle other protocol types as before ...
+            default:
+                ESP_LOGW(MESH_TAG, "Unknown ProtocolType: %u", header->type);
+                break;
         }
     }
     vTaskDelete(NULL);
@@ -239,6 +248,24 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
         last_layer = mesh_layer;
         is_mesh_connected = true;
         if (esp_mesh_is_root()) {
+            // Only RTK node (BASE) should fix itself as root
+            if (dcfg.node_type == BASE) {
+                ESP_ERROR_CHECK(esp_mesh_fix_root(true));
+                ESP_LOGI(MESH_TAG, "Root fixed to RTK node (BASE) after becoming root");
+            } else {
+                ESP_ERROR_CHECK(esp_mesh_fix_root(false));
+                ESP_LOGI(MESH_TAG, "Root not fixed (not BASE) after becoming root");
+                // If not BASE and more than one node in the mesh, yield root
+                int route_table_size = esp_mesh_get_routing_table_size();
+                if (route_table_size > 1) {
+                    esp_err_t err = esp_mesh_waive_root(0, 0);
+                    if (err == ESP_OK) {
+                        ESP_LOGI(MESH_TAG, "Non-BASE node yielded root status (waive_root)");
+                    } else {
+                        ESP_LOGW(MESH_TAG, "esp_mesh_waive_root failed: 0x%x", err);
+                    }
+                }
+            }
             esp_netif_dhcpc_stop(netif_sta);
             esp_netif_dhcpc_start(netif_sta);
         }
@@ -403,6 +430,7 @@ void set_node_type() {
     #endif
 }
 
+
 // Pointer to store the original vprintf function
 static vprintf_like_t original_vprintf = NULL;
 
@@ -429,68 +457,11 @@ static void connect_log_server(void) {
         if (log_server_sock >= 0 && connect(log_server_sock, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
             ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d (IPv4)", addr, CONFIG_DATASERVER_PORT);
             return;
-        } else {
-            ESP_LOGE(MESH_TAG, "Failed to connect to log server at %s:%d (IPv4)", addr, CONFIG_DATASERVER_PORT);
-            if (log_server_sock >= 0) close(log_server_sock);
-            log_server_sock = -1;
-            return;
         }
-    }
-    // Otherwise, treat as hostname: try DNS, if fails, try mDNS
-    struct addrinfo hints = {0};
-    struct addrinfo *res = NULL;
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%d", CONFIG_DATASERVER_PORT);
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    int err = getaddrinfo(addr, port_str, &hints, &res);
-    if (err == 0 && res != NULL) {
-        log_server_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-        if (log_server_sock >= 0 && connect(log_server_sock, res->ai_addr, res->ai_addrlen) == 0) {
-            ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d (DNS)", addr, CONFIG_DATASERVER_PORT);
-            freeaddrinfo(res);
-            return;
-        } else {
-            ESP_LOGE(MESH_TAG, "Failed to connect to log server at %s:%d (DNS)", addr, CONFIG_DATASERVER_PORT);
-            if (log_server_sock >= 0) close(log_server_sock);
-            log_server_sock = -1;
-            freeaddrinfo(res);
-            // continue to mDNS fallback
-        }
-    } else {
-        ESP_LOGW(MESH_TAG, "DNS resolution failed for '%s', trying mDNS fallback", addr);
-    }
-    // mDNS fallback: try as hostname (no .local)
-    //initialize mDNS service
-    esp_err_t mdns_err = mdns_init();
-    if (mdns_err) {
-        ESP_LOGE(MESH_TAG, "MDNS Init failed: %d\n", mdns_err);
+        ESP_LOGE(MESH_TAG, "Failed to connect to log server at %s:%d (IPv4)", addr, CONFIG_DATASERVER_PORT);
+        if (log_server_sock >= 0) close(log_server_sock);
+        log_server_sock = -1;
         return;
-    }
-    char mdns_hostname[64] = {0};
-    size_t addr_len = strlen(addr);
-    if (addr_len >= sizeof(mdns_hostname)) addr_len = sizeof(mdns_hostname) - 1;
-    strncpy(mdns_hostname, addr, addr_len);
-    mdns_hostname[addr_len] = '\0';
-    esp_ip4_addr_t ip4_addr;
-    mdns_err = mdns_query_a(mdns_hostname, 2000, &ip4_addr);
-    if (mdns_err == ESP_OK) {
-        struct sockaddr_in sa_mdns = {0};
-        sa_mdns.sin_family = AF_INET;
-        sa_mdns.sin_port = htons(CONFIG_DATASERVER_PORT);
-        sa_mdns.sin_addr.s_addr = ip4_addr.addr;
-        log_server_sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (log_server_sock >= 0 && connect(log_server_sock, (struct sockaddr *)&sa_mdns, sizeof(sa_mdns)) == 0) {
-            ESP_LOGI(MESH_TAG, "Connected to log server at %s:%d (mDNS fallback)", addr, CONFIG_DATASERVER_PORT);
-            return;
-        } else {
-            ESP_LOGE(MESH_TAG, "Failed to connect to log server at %s:%d (mDNS fallback)", addr, CONFIG_DATASERVER_PORT);
-            if (log_server_sock >= 0) close(log_server_sock);
-            log_server_sock = -1;
-            return;
-        }
-    } else {
-        ESP_LOGE(MESH_TAG, "mDNS query failed for %s: %d", mdns_hostname, mdns_err);
     }
 }
 
@@ -521,12 +492,42 @@ void ip_event_handler(void *arg, esp_event_base_t event_base,
 
 void app_main(void)
 {
+    vTaskDelay(pdMS_TO_TICKS(2000)); // Add 2 second delay at startup
+
     set_node_type();
-    if (node_type == BASE){
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    // Load device config from NVS
+    if (load_device_config(&dcfg) != ESP_OK || dcfg.version == 0) {
+        // First boot or version mismatch: initialize from Kconfig flags
+        dcfg.version = 1;
+        dcfg.battery_analog_pin = CONFIG_BATTERY_ANALOG_PIN;
+        dcfg.node_type = node_type; // Set the board type based on the node type
+        dcfg.ext_antenna = CONFIG_WIFI_ENABLE_EXT_ANT;
+        // Add other config items as needed
+        save_device_config(&dcfg);
+        ESP_LOGI(MESH_TAG, "Device config initialized and saved to NVS");
+    } else {
+        ESP_LOGI(MESH_TAG, "Device config loaded from NVS");
+    }
+
+    // Compute and store firmware MD5 signature
+    char current_md5[33];
+    compute_running_firmware_md5(current_md5);
+    if (strcmp(dcfg.fw_md5, current_md5) != 0) {
+        strncpy(dcfg.fw_md5, current_md5, sizeof(dcfg.fw_md5));
+        save_device_config(&dcfg);
+        ESP_LOGI(MESH_TAG, "Updated firmware MD5 in config: %s", dcfg.fw_md5);
+    } else {
+        ESP_LOGI(MESH_TAG, "Firmware MD5: %s", dcfg.fw_md5);
+    }
+
+    if (dcfg.node_type == BASE){
         original_vprintf = esp_log_set_vprintf(dual_log_function); 
     }
-    ESP_LOGI(MESH_TAG, "Node type: %d", node_type);
-    ESP_ERROR_CHECK(nvs_flash_init());
+
+    ESP_LOGI(MESH_TAG, "Node type: %d", dcfg.node_type);
+
     /*  tcpip initialization */
     ESP_ERROR_CHECK(esp_netif_init());
     /*  event initialization */
@@ -534,44 +535,45 @@ void app_main(void)
     /*  create network interfaces for mesh (only station instance saved for further manipulation, soft AP instance ignored */
     ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
     
-#ifdef NET_NODE
-    // Configure the analog input pin for battery voltage if selected
-    int analog_pin = CONFIG_BATTERY_ANALOG_PIN;
-    if (analog_pin >= 0) {
+    if (dcfg.battery_analog_pin >= 0) {
+        // Configure the analog input pin for battery voltage if selected
+        int analog_pin = CONFIG_BATTERY_ANALOG_PIN;
+        if (analog_pin >= 0) {
 
-        switch (analog_pin) {
-            case 0: adc_channel = ADC_CHANNEL_0; break; // A0
-            case 1: adc_channel = ADC_CHANNEL_1; break; // A1
-            case 2: adc_channel = ADC_CHANNEL_2; break; // A2
-            default: adc_channel = -1; break;
-        }
+            switch (analog_pin) {
+                case 0: adc_channel = ADC_CHANNEL_0; break; // A0
+                case 1: adc_channel = ADC_CHANNEL_1; break; // A1
+                case 2: adc_channel = ADC_CHANNEL_2; break; // A2
+                default: adc_channel = -1; break;
+            }
 
-        if (adc_channel != -1) {
-            setup_analog_input(adc_channel, &adc_handle);
-            ESP_LOGI(MESH_TAG, "Battery analog input configured on pin A%d", analog_pin);
+            if (adc_channel != -1) {
+                setup_analog_input(adc_channel, &adc_handle);
+                ESP_LOGI(MESH_TAG, "Battery analog input configured on pin A%d", analog_pin);
 
-            ESP_LOGI(MESH_TAG, "Battery Voltage: %dmV", read_battery_mv(adc_channel, &adc_handle));
+                ESP_LOGI(MESH_TAG, "Battery Voltage: %dmV", read_battery_mv(adc_channel, &adc_handle));
 
-            // Clean up the ADC handle after use
-            // ESP_ERROR_CHECK(adc_oneshot_del_unit(adc_handle));
+                // Clean up the ADC handle after use
+                // ESP_ERROR_CHECK(adc_oneshot_del_unit(adc_handle));
+            }
         }
     }
-#endif
 
-#if defined(RTK_BASE_NODE) || defined(ROBOT_NODE)
-    /*  serial initialization */
-    // Setup the serial port
-    setup_serial_port();
-    // Create the serial data task
-    xTaskCreate(serial_data_task, "SerialDataTask", 4096, NULL, 5, NULL);
-#endif
+    if (dcfg.node_type == BASE || dcfg.node_type == ROBOT){
+        /*  serial initialization */
+        // Setup the serial port
+        setup_serial_port();
+        // Create the serial data task
+        xTaskCreate(serial_data_task, "SerialDataTask", 4096, NULL, 5, NULL);
+    }
 
     /*  wifi initialization */
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
     /*  XIAO ESP32C6 External Antenna Setup*/
-#ifdef CONFIG_WIFI_ENABLE_EXT_ANT
-    rf_switch_ext();
-#endif
+    if (dcfg.ext_antenna){
+        rf_switch_ext();
+    }
+
     ESP_ERROR_CHECK(esp_wifi_init(&config));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
@@ -614,8 +616,16 @@ void app_main(void)
            strlen(CONFIG_MESH_AP_PASSWD));
     ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
 
+    // Set vote percentage for root election bias
+    if (dcfg.node_type == BASE) {
+        ESP_ERROR_CHECK(esp_mesh_set_vote_percentage(1)); // Strongly prefer RTK node as root
+    } else {
+        ESP_ERROR_CHECK(esp_mesh_set_vote_percentage(0.01)); // Minimize chance for non-RTK node
+    }
+
     /* mesh start */
     ESP_ERROR_CHECK(esp_mesh_start());
+
 #ifdef CONFIG_MESH_ENABLE_PS
     /* set the device active duty cycle. (default:10, MESH_PS_DEVICE_DUTY_REQUEST) */
     ESP_ERROR_CHECK(esp_mesh_set_active_duty_cycle(CONFIG_MESH_PS_DEV_DUTY, CONFIG_MESH_PS_DEV_DUTY_TYPE));

@@ -1,8 +1,19 @@
+#ifndef CFG_HELPER_H
+#define CFG_HELPER_H
+
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include <string.h>
+//https://github.com/platformio/platform-espressif32/issues/957
+#define MBEDTLS_CONFIG_FILE "mbedtls/esp_config.h"
+#include "mbedtls/md5.h"
+#include "esp_ota_ops.h"
+
 
 static const char *CFG_H_TAG = "cfg_helper";
 //static const int ADC_ATTEN_DB_12_MV_MAX = 2450; // Max voltage for 12dB attenuation
@@ -69,3 +80,23 @@ static inline int read_battery_mv(adc_channel_t channel, adc_oneshot_unit_handle
     // Convert the ADC reading to a voltage (in mV)
     return adc_reading * 2;
 }
+
+// Device configuration structure for persistent storage in NVS
+// this is for deltas in the HW between the 3 different node types.
+typedef struct {
+    uint32_t version; // Version of the configuration stored (used for init)
+    uint8_t node_type; // node type identifier
+    int8_t battery_analog_pin; // Analog pin for battery voltage reading
+    uint8_t ext_antenna; // Flag to indicate if external antenna is used
+    char fw_md5[33]; // 32 hex chars + null terminator for firmware signature
+    // Add other config items as needed
+} device_config_t;
+
+// Save and load functions for device config
+esp_err_t save_device_config(const device_config_t *config);
+esp_err_t load_device_config(device_config_t *config);
+
+
+void compute_running_firmware_md5(char *out_md5_hex);
+
+#endif // CFG_HELPER_H

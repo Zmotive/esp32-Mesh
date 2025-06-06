@@ -26,10 +26,11 @@ menu "Mesh Configuration"
             Enable/Disable Power Save function.
 
     config WIFI_ENABLE_EXT_ANT
-        bool "Enable External Antenna (XIAO ESP32C6)"
-        default n
+        int "Enable External Antenna (XIAO ESP32C6)"
+        range 0 1
+        default 0
         help
-            Enables the external antennal and disables the internal antenna on the XIAO ESP32C6.
+            Enables the external antenna (1) and disables the internal antenna (0) on the XIAO ESP32C6.
 
     choice
         bool "Mesh PS device duty cycle type"
@@ -190,6 +191,12 @@ menu "Mesh Configuration"
         default 9000
         help
             The TCP port number of the log server. Default is 9000.
+    
+    config ENABLE_ECHO_PROTOCOL
+        bool "Enable Echo Protocol"
+        default n
+        help
+            Echo is just used for diagnostics and data to test with.
 
 endmenu
 

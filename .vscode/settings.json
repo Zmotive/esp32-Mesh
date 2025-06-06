@@ -2,6 +2,12 @@
     "files.associations": {
         "esp_mesh.h": "c",
         "cstdlib": "c",
-        "semphr.h": "c"
+        "semphr.h": "c",
+        "cstdint": "c",
+        "esp_event.h": "c",
+        "array": "c",
+        "string": "c",
+        "string_view": "c",
+        "span": "c"
     }
 }
